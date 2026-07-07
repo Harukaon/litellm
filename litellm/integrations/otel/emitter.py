@@ -13,15 +13,17 @@ from litellm.integrations.otel.mappers.base import AttributeMapper, SpanData
 from litellm.integrations.otel.model.payloads import (
     GuardrailSpanData,
     LLMCallSpanData,
+    MCPToolCallSpanData,
     ServiceSpanData,
 )
 from litellm.integrations.otel.plumbing.providers import to_otel_span_kind
-from litellm.integrations.otel.model.semconv import Error
+from litellm.integrations.otel.model.semconv import Error, ExceptionEvent
 from litellm.integrations.otel.model.spans import (
     SPAN_REGISTRY,
     SpanRole,
     guardrail_span_name,
     llm_call_span_name,
+    mcp_tool_call_span_name,
     service_span_name,
 )
 
@@ -30,6 +32,7 @@ from litellm.integrations.otel.model.spans import (
 # have no builder here.
 _NAME_BUILDERS: dict[SpanRole, Callable[..., str]] = {
     SpanRole.LLM_CALL: llm_call_span_name,
+    SpanRole.MCP_TOOL_CALL: mcp_tool_call_span_name,
     SpanRole.GUARDRAIL: guardrail_span_name,
     # DB_CALL and SERVICE are both built from ServiceSpanData; they differ only in
     # span kind (CLIENT vs INTERNAL) and attribute vocabulary, not in naming.
@@ -55,9 +58,7 @@ class SpanEmitter:
         # The mapper chain is the sole source of span attributes. When not
         # passed in, resolve it from the config so there's one source of truth.
         self._mappers: list[AttributeMapper] = (
-            list(mappers)
-            if mappers is not None
-            else resolve_mappers(config.mapper_names)
+            list(mappers) if mappers is not None else resolve_mappers(config.mapper_names)
         )
         # Bounded LRU (ordered by insertion / most-recent touch). Storing keys
         # only — the value is unused — so it behaves like a capped set.
@@ -121,10 +122,10 @@ class SpanEmitter:
         Return the span, or ``None`` if it was deduplicated away. ``tracer``
         overrides the bound tracer for this span, used for per-request routing.
         """
-        # Only LLM-call spans carry a dedup key; LLM-call and service spans
-        # carry an ``error`` field. ``isinstance`` narrows the type for mypy and
-        # keeps the engine free of duck-typed attribute reads.
-        dedup_key = data.identity.call_id if isinstance(data, LLMCallSpanData) else None
+        # LLM-call and MCP tool-call spans carry a dedup key (their request's
+        # call id), so a sync+async double-firing coalesces. ``isinstance`` narrows
+        # the type for mypy and keeps the engine free of duck-typed attribute reads.
+        dedup_key = data.identity.call_id if isinstance(data, (LLMCallSpanData, MCPToolCallSpanData)) else None
         if self._seen(dedup_key, role):
             return None
         span = self.start_span(
@@ -160,13 +161,29 @@ class SpanEmitter:
                 span.set_attribute(key, value)
         error = (
             data.error
-            if isinstance(data, (LLMCallSpanData, ServiceSpanData, GuardrailSpanData))
+            if isinstance(
+                data,
+                (
+                    LLMCallSpanData,
+                    MCPToolCallSpanData,
+                    ServiceSpanData,
+                    GuardrailSpanData,
+                ),
+            )
             else None
         )
         if error and (error.error_type or error.message):
-            span.set_attribute(Error.TYPE, error.error_type or "error")
-            span.set_status(
-                Status(StatusCode.ERROR, error.message or error.error_type or "error")
+            error_type = error.error_type or "error"
+            message = error.message or error.error_type or "error"
+            span.set_attribute(Error.TYPE, error_type)
+            span.set_status(Status(StatusCode.ERROR, message))
+            # Carry the full message on the standard ``exception`` event so backends
+            # map it as full text under ``exception.message``. Setting it as a bare
+            # string attribute instead lets backends like Elasticsearch dynamic-map
+            # it to a ``keyword`` capped at 1024 chars, truncating the message.
+            span.add_event(
+                ExceptionEvent.NAME,
+                {ExceptionEvent.TYPE: error_type, ExceptionEvent.MESSAGE: message},
             )
         # On success leave the status UNSET (the semconv default) rather than
         # forcing OK — that matches the FastAPI server span and avoids implying a

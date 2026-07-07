@@ -1,5 +1,6 @@
 """Tests for MCP OAuth discoverable endpoints"""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -531,6 +532,548 @@ async def test_register_client_remote_registration_success():
         call_args.kwargs["json"]["token_endpoint_auth_method"]
         == request_payload["token_endpoint_auth_method"]
     )
+
+
+@pytest.mark.asyncio
+async def test_register_client_persists_dcr_client_identity():
+    """A dynamic client registration (RFC 7591) must persist the issued client_id /
+    client_secret / token_endpoint_auth_method and the token_url onto the server row so
+    autonomous refresh can authenticate as the registered client. Without persistence the
+    minted client_id is discarded and the refresh_token grant has no client identity."""
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client_with_server,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id=None,
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url="https://provider.example/oauth/token",
+        registration_url="https://provider.example/oauth/register",
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "client_id": "generated-client",
+        "client_secret": "generated-secret",
+        "token_endpoint_auth_method": "client_secret_basic",
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock(return_value=mock_response)
+
+    mock_update = AsyncMock(return_value=MagicMock())
+    mock_update_server = AsyncMock()
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+            return_value=mock_async_client,
+        ),
+        patch("litellm.proxy.utils.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch("litellm.proxy._experimental.mcp_server.db.update_mcp_server", new=mock_update),
+        patch.object(global_mcp_server_manager, "update_server", new=mock_update_server),
+    ):
+        response = await register_client_with_server(
+            request=mock_request,
+            mcp_server=oauth2_server,
+            client_name="Litellm Proxy",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="client_secret_basic",
+            persist_credentials=True,
+        )
+
+    import json
+
+    assert response.status_code == 200
+    assert json.loads(response.body.decode("utf-8")) == mock_response.json.return_value
+
+    mock_update.assert_called_once()
+    update_data = mock_update.call_args.kwargs["data"]
+    assert update_data.server_id == "remote_server"
+    assert update_data.token_url == "https://provider.example/oauth/token"
+    assert update_data.credentials["client_id"] == "generated-client"
+    assert update_data.credentials["client_secret"] == "generated-secret"
+    assert update_data.credentials["token_endpoint_auth_method"] == "client_secret_basic"
+
+    mock_update_server.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_register_client_does_not_clobber_token_url_when_absent():
+    """When the in-memory server has no token_url, the DCR persist must omit it from the
+    partial update rather than passing None, so exclude_unset leaves the token_url column
+    untouched instead of overwriting an existing value with NULL."""
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client_with_server,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id=None,
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url=None,
+        registration_url="https://provider.example/oauth/register",
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"client_id": "generated-client"}
+    mock_response.raise_for_status = MagicMock()
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock(return_value=mock_response)
+
+    mock_update = AsyncMock(return_value=MagicMock())
+    mock_update_server = AsyncMock()
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+            return_value=mock_async_client,
+        ),
+        patch("litellm.proxy.utils.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch("litellm.proxy._experimental.mcp_server.db.update_mcp_server", new=mock_update),
+        patch.object(global_mcp_server_manager, "update_server", new=mock_update_server),
+    ):
+        await register_client_with_server(
+            request=mock_request,
+            mcp_server=oauth2_server,
+            client_name="Litellm Proxy",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            persist_credentials=True,
+        )
+
+    mock_update.assert_called_once()
+    update_data = mock_update.call_args.kwargs["data"]
+    assert update_data.credentials["client_id"] == "generated-client"
+    assert "token_url" not in update_data.model_fields_set
+
+
+@pytest.mark.asyncio
+async def test_register_client_reuses_persisted_client_id_for_non_admin_when_registry_is_stale():
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client_with_server,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id=None,
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url="https://provider.example/oauth/token",
+        registration_url="https://provider.example/oauth/register",
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    persisted_server = MagicMock()
+    persisted_server.credentials = {"client_id": "persisted-client"}
+    mock_get_mcp_server = AsyncMock(return_value=persisted_server)
+    mock_update_mcp_server = AsyncMock()
+    mock_update_server = AsyncMock()
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock()
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+            return_value=mock_async_client,
+        ),
+        patch("litellm.proxy.utils.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch(
+            "litellm.proxy._experimental.mcp_server.db.get_mcp_server",
+            new=mock_get_mcp_server,
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.db.update_mcp_server",
+            new=mock_update_mcp_server,
+        ),
+        patch.object(global_mcp_server_manager, "update_server", new=mock_update_server),
+    ):
+        response = await register_client_with_server(
+            request=mock_request,
+            mcp_server=oauth2_server,
+            client_name="Litellm Proxy",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            persist_credentials=False,
+        )
+
+    assert response["client_id"] == "remote_server"
+    assert oauth2_server.client_id == "persisted-client"
+    mock_async_client.post.assert_not_called()
+    mock_update_mcp_server.assert_not_called()
+    mock_update_server.assert_called_once_with(persisted_server)
+
+
+@pytest.mark.asyncio
+async def test_register_client_reuse_refreshes_request_server_when_manager_update_fails():
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client_with_server,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id=None,
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url="https://provider.example/oauth/token",
+        registration_url="https://provider.example/oauth/register",
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    persisted_server = MagicMock()
+    persisted_server.credentials = {
+        "client_id": "persisted-client",
+        "client_secret": "persisted-secret",
+        "token_endpoint_auth_method": "client_secret_basic",
+    }
+    mock_get_mcp_server = AsyncMock(return_value=persisted_server)
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock()
+    mock_update_server = AsyncMock(side_effect=RuntimeError("registry update failed"))
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+            return_value=mock_async_client,
+        ),
+        patch("litellm.proxy.utils.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch(
+            "litellm.proxy._experimental.mcp_server.db.get_mcp_server",
+            new=mock_get_mcp_server,
+        ),
+        patch.object(global_mcp_server_manager, "update_server", new=mock_update_server),
+    ):
+        response = await register_client_with_server(
+            request=mock_request,
+            mcp_server=oauth2_server,
+            client_name="Litellm Proxy",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            persist_credentials=False,
+        )
+
+    assert response["client_id"] == "remote_server"
+    assert oauth2_server.client_id == "persisted-client"
+    assert oauth2_server.client_secret == "persisted-secret"
+    assert oauth2_server.token_endpoint_auth_method == "client_secret_basic"
+    mock_async_client.post.assert_not_called()
+    mock_update_server.assert_called_once_with(persisted_server)
+
+
+@pytest.mark.asyncio
+async def test_register_client_returns_reused_client_when_concurrent_persist_wins():
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client_with_server,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id=None,
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url="https://provider.example/oauth/token",
+        registration_url="https://provider.example/oauth/register",
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"client_id": "generated-client"}
+    mock_response.raise_for_status = MagicMock()
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock(return_value=mock_response)
+
+    persisted_server = MagicMock()
+    persisted_server.credentials = {"client_id": "persisted-client"}
+    mock_get_mcp_server = AsyncMock(side_effect=[None, persisted_server])
+    mock_update_mcp_server = AsyncMock()
+    mock_update_server = AsyncMock()
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+            return_value=mock_async_client,
+        ),
+        patch("litellm.proxy.utils.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch(
+            "litellm.proxy._experimental.mcp_server.db.get_mcp_server",
+            new=mock_get_mcp_server,
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.db.update_mcp_server",
+            new=mock_update_mcp_server,
+        ),
+        patch.object(global_mcp_server_manager, "update_server", new=mock_update_server),
+    ):
+        response = await register_client_with_server(
+            request=mock_request,
+            mcp_server=oauth2_server,
+            client_name="Litellm Proxy",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            persist_credentials=True,
+        )
+
+    assert response["client_id"] == "remote_server"
+    assert oauth2_server.client_id == "persisted-client"
+    mock_async_client.post.assert_called_once()
+    mock_update_mcp_server.assert_not_called()
+    mock_update_server.assert_called_once_with(persisted_server)
+
+
+@pytest.mark.asyncio
+async def test_register_client_reuses_existing_client_id_without_re_dcr():
+    """A server that already has a client_id (admin-configured or previously DCR'd) must be
+    reused, not re-registered, even without a client_secret. A client_id is one-per-application
+    in OAuth and shared across users; re-minting per authorize would orphan other users' refresh
+    tokens by overwriting the server's client_id."""
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    global_mcp_server_manager.registry.clear()
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id="existing-shared-client",
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url="https://provider.example/oauth/token",
+        registration_url="https://provider.example/oauth/register",
+    )
+    global_mcp_server_manager.registry[oauth2_server.server_id] = oauth2_server
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    request_payload = {
+        "client_name": "Litellm Proxy",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock()
+
+    try:
+        with (
+            patch(
+                "litellm.proxy._experimental.mcp_server.discoverable_endpoints._read_request_body",
+                new=AsyncMock(return_value=request_payload),
+            ),
+            patch(
+                "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+                return_value=mock_async_client,
+            ),
+        ):
+            response = await register_client(request=mock_request, mcp_server_name=oauth2_server.server_name)
+    finally:
+        global_mcp_server_manager.registry.clear()
+
+    mock_async_client.post.assert_not_called()
+    body = response if isinstance(response, dict) else json.loads(response.body.decode("utf-8"))
+    assert body["client_secret"] == "dummy"
+
+
+@pytest.mark.asyncio
+async def test_public_register_route_does_not_persist_client_credentials():
+    """The unauthenticated root /register route must not persist the DCR result onto the
+    server row; only the authenticated management path passes persist_credentials=True. An
+    external caller could otherwise bind a caller-controlled client (and leak its secret) to
+    a server that has no client yet."""
+    try:
+        from fastapi import Request
+
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+            register_client,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._types import MCPTransport
+        from litellm.types.mcp import MCPAuth
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+    except ImportError:
+        pytest.skip("MCP discoverable endpoints not available")
+
+    global_mcp_server_manager.registry.clear()
+    oauth2_server = MCPServer(
+        server_id="remote_server",
+        name="remote_server",
+        server_name="remote_server",
+        alias="remote_server",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id=None,
+        client_secret=None,
+        authorization_url="https://provider.example/oauth/authorize",
+        token_url="https://provider.example/oauth/token",
+        registration_url="https://provider.example/oauth/register",
+    )
+    global_mcp_server_manager.registry[oauth2_server.server_id] = oauth2_server
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://proxy.litellm.example/"
+    mock_request.headers = {}
+
+    request_payload = {
+        "client_name": "attacker",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "client_id": "attacker-client",
+        "client_secret": "attacker-secret",
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_async_client = MagicMock()
+    mock_async_client.post = AsyncMock(return_value=mock_response)
+
+    mock_update = AsyncMock(return_value=MagicMock())
+
+    try:
+        with (
+            patch(
+                "litellm.proxy._experimental.mcp_server.discoverable_endpoints._read_request_body",
+                new=AsyncMock(return_value=request_payload),
+            ),
+            patch(
+                "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+                return_value=mock_async_client,
+            ),
+            patch("litellm.proxy.utils.get_prisma_client_or_throw", return_value=MagicMock()),
+            patch.object(global_mcp_server_manager, "update_server", new=AsyncMock()),
+            patch("litellm.proxy._experimental.mcp_server.db.update_mcp_server", new=mock_update),
+        ):
+            await register_client(request=mock_request, mcp_server_name=oauth2_server.server_name)
+    finally:
+        global_mcp_server_manager.registry.clear()
+
+    mock_update.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1515,7 +2058,7 @@ async def test_oauth_protected_resource_returns_empty_scopes_when_none():
     mock_request.headers = {}
 
     try:
-        response = _build_oauth_protected_resource_response(
+        response = await _build_oauth_protected_resource_response(
             request=mock_request,
             mcp_server_name="atlassian_mcp",
             use_standard_pattern=False,
@@ -2005,7 +2548,7 @@ async def test_discovery_root_does_not_expose_private_server_for_external_client
                 request=mock_request,
                 mcp_server_name=None,
             )
-            resource_response = _build_oauth_protected_resource_response(
+            resource_response = await _build_oauth_protected_resource_response(
                 request=mock_request,
                 mcp_server_name=None,
                 use_standard_pattern=False,
@@ -2661,3 +3204,199 @@ async def test_token_endpoint_sets_no_store_cache_control():
 
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
+
+
+async def _exchange_with_upstream_token_response(upstream_body):
+    from fastapi import Request
+
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        exchange_token_with_server,
+    )
+    from litellm.proxy._types import MCPTransport
+    from litellm.types.mcp import MCPAuth
+    from litellm.types.mcp_server.mcp_server_manager import MCPServer
+
+    server = MCPServer(
+        server_id="t",
+        name="t",
+        server_name="t",
+        alias="t",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id="cid",
+        client_secret="cs",
+        authorization_url="https://provider.com/oauth/authorize",
+        token_url="https://provider.com/oauth/token",
+    )
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://litellm.example.com/"
+    mock_request.headers = {}
+
+    fake_http_response = MagicMock()
+    fake_http_response.json.return_value = upstream_body
+    fake_http_response.raise_for_status = MagicMock()
+    fake_http_client = MagicMock()
+    fake_http_client.post = AsyncMock(return_value=fake_http_response)
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+        return_value=fake_http_client,
+    ):
+        response = await exchange_token_with_server(
+            request=mock_request,
+            mcp_server=server,
+            grant_type="authorization_code",
+            code="c",
+            redirect_uri="http://127.0.0.1:3000/cb",
+            client_id="cid",
+            client_secret=None,
+            code_verifier=None,
+        )
+    return json.loads(response.body)
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_omits_expires_in_when_upstream_omits_it():
+    """A provider that issues a non-expiring token (e.g. Slack without token
+    rotation) returns no ``expires_in``. The exchange must mirror that and omit
+    ``expires_in`` rather than fabricate a 1-hour TTL, so the stored credential
+    is treated as non-expiring instead of dying after an hour."""
+    body = await _exchange_with_upstream_token_response(
+        {"access_token": "tok", "token_type": "Bearer"}
+    )
+    assert "expires_in" not in body
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_passes_through_upstream_expires_in():
+    """When the provider does send ``expires_in`` (e.g. Slack with token
+    rotation), the exchange forwards the real value unchanged."""
+    body = await _exchange_with_upstream_token_response(
+        {"access_token": "tok", "token_type": "Bearer", "expires_in": 43200}
+    )
+    assert body["expires_in"] == 43200
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_uses_client_secret_basic_when_configured():
+    """LIT-4091: a server with token_endpoint_auth_method=client_secret_basic must send the
+    credentials as an HTTP Basic Authorization header and omit client_secret from the body;
+    providers requiring Basic rejected body credentials with invalid_client."""
+    import base64
+    from unittest.mock import AsyncMock
+
+    from fastapi import Request
+
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        token_endpoint,
+    )
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+        global_mcp_server_manager,
+    )
+    from litellm.proxy._types import MCPTransport
+    from litellm.types.mcp import MCPAuth
+    from litellm.types.mcp_server.mcp_server_manager import MCPServer
+
+    global_mcp_server_manager.registry.clear()
+    oauth2_server = MCPServer(
+        server_id="basic_mcp",
+        name="basic_mcp",
+        server_name="basic_mcp",
+        alias="basic_mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id="basic-client",
+        client_secret="basic-secret",
+        authorization_url="https://idp.example.com/authorize",
+        token_url="https://idp.example.com/oauth2/token",
+        token_endpoint_auth_method="client_secret_basic",
+    )
+    global_mcp_server_manager.registry[oauth2_server.server_id] = oauth2_server
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://litellm-proxy.example.com/"
+    mock_request.headers = {}
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "access_token": "at",
+        "token_type": "Bearer",
+        "expires_in": 3599,
+    }
+    mock_response.raise_for_status = MagicMock()
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client"
+    ) as mock_get_client:
+        mock_async_client = MagicMock()
+        mock_async_client.post = AsyncMock(return_value=mock_response)
+        mock_get_client.return_value = mock_async_client
+
+        await token_endpoint(
+            request=mock_request,
+            grant_type="authorization_code",
+            code="auth-code",
+            redirect_uri="http://localhost/callback",
+            client_id="basic-client",
+            mcp_server_name="basic_mcp",
+            client_secret="basic-secret",
+            code_verifier="verifier",
+        )
+
+    call_args = mock_async_client.post.call_args
+    expected = "Basic " + base64.b64encode(b"basic-client:basic-secret").decode()
+    assert call_args[1]["headers"]["Authorization"] == expected
+    assert "client_secret" not in call_args[1]["data"]
+    assert "client_id" not in call_args[1]["data"]
+    assert call_args[1]["data"]["grant_type"] == "authorization_code"
+    assert call_args[1]["data"]["code"] == "auth-code"
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_client_secret_basic_without_secret_returns_400():
+    """A server configured client_secret_basic but missing its secret is a misconfiguration; the
+    inbound /token endpoint surfaces it as a 400 rather than silently posting a downgraded request."""
+    from fastapi import HTTPException, Request
+
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+        token_endpoint,
+    )
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+        global_mcp_server_manager,
+    )
+    from litellm.proxy._types import MCPTransport
+    from litellm.types.mcp import MCPAuth
+    from litellm.types.mcp_server.mcp_server_manager import MCPServer
+
+    global_mcp_server_manager.registry.clear()
+    oauth2_server = MCPServer(
+        server_id="basic_no_secret",
+        name="basic_no_secret",
+        server_name="basic_no_secret",
+        alias="basic_no_secret",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        client_id="basic-client",
+        client_secret=None,
+        authorization_url="https://idp.example.com/authorize",
+        token_url="https://idp.example.com/oauth2/token",
+        token_endpoint_auth_method="client_secret_basic",
+    )
+    global_mcp_server_manager.registry[oauth2_server.server_id] = oauth2_server
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.base_url = "https://litellm-proxy.example.com/"
+    mock_request.headers = {}
+
+    with pytest.raises(HTTPException) as exc_info:
+        await token_endpoint(
+            request=mock_request,
+            grant_type="authorization_code",
+            code="auth-code",
+            redirect_uri="http://localhost/callback",
+            client_id="basic-client",
+            mcp_server_name="basic_no_secret",
+            client_secret=None,
+            code_verifier="verifier",
+        )
+    assert exc_info.value.status_code == 400

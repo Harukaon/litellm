@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Final, Protocol
 from pydantic import TypeAdapter
 
 from litellm.litellm_core_utils.core_helpers import require_attributes
+from litellm.constants import FREE_SSO_USER_LIMIT
 from litellm.models.user import LiteLLM_UserTable, SCIMPlaceholder
 from litellm.repositories.base_repository import BaseRepository, DbRecord, record_to_dict
 from litellm.repositories.chunked_in import IN_LIST_CHUNK_SIZE
@@ -189,7 +190,7 @@ class UserRepository(BaseRepository[LiteLLM_UserTable]):
             existing: Final = await transaction.litellm_usertable.find_unique(where={"user_id": data["user_id"]})
             if existing is not None:
                 return existing
-            if await _count_billable_users(transaction.litellm_usertable) >= 5:
+            if await _count_billable_users(transaction.litellm_usertable) >= FREE_SSO_USER_LIMIT:
                 return None
             return await transaction.litellm_usertable.upsert(
                 where={"user_id": data["user_id"]}, data={"create": dict(data), "update": {}}

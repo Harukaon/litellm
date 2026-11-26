@@ -57,7 +57,7 @@ from tests.unit.proxy.auth._user_table import UserTable, prisma_over, user_row
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("billable_users", "premium", "admitted"),
-    [(4, False, True), (5, False, False), (26, False, False), (26, True, True)],
+    [(4, False, True), (99, False, True), (100, False, False), (125, False, False), (125, True, True)],
 )
 async def test_sso_auto_creation_enforces_free_user_cap_through_new_user(
     monkeypatch: pytest.MonkeyPatch, billable_users: int, premium: bool, admitted: bool
@@ -105,7 +105,7 @@ async def test_sso_auto_creation_enforces_free_user_cap_through_new_user(
         with pytest.raises(ProxyException) as error:
             await insert_sso_user(CustomOpenID(id=row.user_id, team_ids=[]), values)
         assert str(error.value.code) == "403"
-        assert "SSO for more than 5 users" in error.value.message
+        assert "SSO for more than 100 users" in error.value.message
         table.create.assert_not_awaited()
         table.upsert.assert_not_awaited()
 

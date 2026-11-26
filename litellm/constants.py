@@ -2404,3 +2404,6 @@ HARNESS_SNAPSHOT_SKIP_DIRS: Final = frozenset(
 )
 
 DEFAULT_TOOL_LOOP_MAX_ROUNDS: Final = 20
+
+# FeedMob keeps the historical auto-provisioning allowance for the company SSO directory.
+FREE_SSO_USER_LIMIT: Final = 100

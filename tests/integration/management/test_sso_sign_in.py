@@ -180,7 +180,7 @@ def test_free_sso_admission_preserves_existing_users_and_serializes_the_last_sea
     monkeypatch.setenv(OWNED_STATE_VARIABLE, OwnedState.PRIVATE.value)
     monkeypatch.delenv("LITELLM_LICENSE", raising=False)
     with _sso_gateway(tmp_path, {}) as gateway:
-        for index in range(4):
+        for index in range(99):
             signed_in: Final = _sign_in(gateway, f"free-sso-{index}")
             assert signed_in.status_code == 303, signed_in.text
 
@@ -189,7 +189,7 @@ def test_free_sso_admission_preserves_existing_users_and_serializes_the_last_sea
             responses: Final = tuple(pool.map(partial(_sign_in, gateway), contenders))
 
         assert sorted(response.status_code for response in responses) == [303, 403, 403, 403, 403, 403, 403, 403]
-        assert gateway.rows('SELECT COUNT(*) AS count FROM "LiteLLM_UserTable"', ()) == [{"count": 5}]
+        assert gateway.rows('SELECT COUNT(*) AS count FROM "LiteLLM_UserTable"', ()) == [{"count": 100}]
         for subject, response in zip(contenders, responses):
             if response.status_code == 403:
                 assert "requires a LiteLLM Enterprise license" in response.text
@@ -206,7 +206,7 @@ def test_free_sso_admission_preserves_existing_users_and_serializes_the_last_sea
         above_capacity: Final = _sign_in(gateway, "free-sso-0")
         refused: Final = _sign_in(gateway, "free-sso-extra")
         assert (above_capacity.status_code, refused.status_code) == (303, 403)
-        assert gateway.rows('SELECT COUNT(*) AS count FROM "LiteLLM_UserTable"', ()) == [{"count": 6}]
+        assert gateway.rows('SELECT COUNT(*) AS count FROM "LiteLLM_UserTable"', ()) == [{"count": 101}]
 
 
 @pytest.mark.parametrize(

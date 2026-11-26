@@ -60,6 +60,7 @@ from litellm import _custom_logger_compatible_callbacks_literal
 from litellm.constants import (
     DEFAULT_MODEL_CREATED_AT_TIME,
     FILE_USAGE_MAX_TRACKED_COUNTERS,
+    FREE_SSO_USER_LIMIT,
     LITELLM_CONFIG_CACHE_TTL_SECONDS,
     LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
     LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
@@ -7004,7 +7005,7 @@ class PrismaClient:
                     if new_user_row is None:
                         raise HTTPException(
                             status_code=403,
-                            detail="SSO for more than 5 users requires a LiteLLM Enterprise license. Existing users can still sign in.",
+                            detail=f"SSO for more than {FREE_SSO_USER_LIMIT} users requires a LiteLLM Enterprise license. Existing users can still sign in.",
                         )
                 except UniqueViolationError as e:
                     _raise_user_unique_conflict(e, db_data["user_id"], allow_existing=allow_existing_user)

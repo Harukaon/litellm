@@ -5,6 +5,7 @@ Enterprise internal user management endpoints
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from litellm.constants import FREE_SSO_USER_LIMIT
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.management_endpoints.internal_user_endpoints import user_api_key_auth
 
@@ -38,12 +39,12 @@ async def available_enterprise_users(
         )
 
     if not premium_user:
-        # check if SSO is enabled - show 5 user limit
+        # check if SSO is enabled - show the configured free-user allowance
         from litellm.proxy.auth.auth_utils import has_user_setup_sso
 
         if has_user_setup_sso():
             premium_user_data = EnterpriseLicenseData(
-                max_users=5,
+                max_users=FREE_SSO_USER_LIMIT,
             )
 
     user_count = await UserRepository(prisma_client).count_billable_users()
